@@ -271,7 +271,9 @@ class Gemma4ForCausalLM(nn.Module):
         self.model = _Gemma4Outer(tc)
         self.lm_head = ParallelLMHead(tc.vocab_size, tc.hidden_size)
         if tc.tie_word_embeddings:
-            self.lm_head.weight.data = self.model.language_model.embed_tokens.weight.data
+            # Share the same Parameter so the loader's in-place copy propagates to lm_head.
+            # .data= would copy initial garbage values and break after weight loading.
+            self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return self.model.language_model(input_ids, positions)
