@@ -48,3 +48,18 @@ class RMSNorm(nn.Module):
             return self.rms_forward(x)
         else:
             return self.add_rms_forward(x, residual)
+
+
+class RMSNormNoScale(nn.Module):
+    """RMSNorm without learnable weight (used for v_norm in Gemma4)."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+
+    @torch.compile
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x.to(orig)

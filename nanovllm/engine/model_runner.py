@@ -7,9 +7,32 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.gemma4 import Gemma4ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+
+_MODEL_REGISTRY = {
+    "qwen3": Qwen3ForCausalLM,
+    "gemma4": Gemma4ForCausalLM,
+    "gemma4_text": Gemma4ForCausalLM,
+}
+
+
+def _resolve_model_class(hf_config):
+    mt = getattr(hf_config, "model_type", "")
+    if mt in _MODEL_REGISTRY:
+        return _MODEL_REGISTRY[mt]
+    for arch in getattr(hf_config, "architectures", []):
+        for key, cls in _MODEL_REGISTRY.items():
+            if key.replace("_", "").lower() in arch.lower():
+                return cls
+    raise ValueError(f"Unsupported model_type={mt!r}. Add it to _MODEL_REGISTRY.")
+
+
+def _text_config(hf_config):
+    """Return the config object that holds the actual model architecture fields."""
+    return getattr(hf_config, "text_config", hf_config)
 
 
 class ModelRunner:
@@ -23,12 +46,18 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        # MoE models have data-dependent routing — incompatible with CUDA graphs
+        tc = _text_config(hf_config)
+        if getattr(tc, 'enable_moe_block', False):
+            self.enforce_eager = True
+
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        model_cls = _resolve_model_class(hf_config)
+        self.model = model_cls(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -103,21 +132,41 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
+        tc = _text_config(hf_config)
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        dtype_bytes = hf_config.dtype.itemsize
+
+        # Build per-layer (n_kv_heads, head_dim) — handles both uniform and hybrid attention
+        layer_types = getattr(tc, "layer_types", ["full_attention"] * tc.num_hidden_layers)
+        kv_dims = []
+        for lt in layer_types:
+            if lt == "sliding_attention":
+                n_kv = tc.num_key_value_heads // self.world_size
+                hd = tc.head_dim
+            else:
+                n_kv_full = getattr(tc, "num_global_key_value_heads", None) or tc.num_key_value_heads
+                n_kv = n_kv_full // self.world_size
+                hd = getattr(tc, "global_head_dim", None) or tc.head_dim
+            kv_dims.append((n_kv, hd))
+
+        block_bytes = sum(2 * self.block_size * n * h * dtype_bytes for n, h in kv_dims)
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        assert config.num_kvcache_blocks > 0, "Not enough GPU memory for KV cache"
+
+        # Allocate one k_cache / v_cache tensor per layer
+        B = config.num_kvcache_blocks
+        self.kv_caches = [
+            (torch.empty(B, self.block_size, n, h), torch.empty(B, self.block_size, n, h))
+            for n, h in kv_dims
+        ]
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
+                module.k_cache, module.v_cache = self.kv_caches[layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
@@ -223,6 +272,7 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
+        tc = _text_config(hf_config)
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
@@ -230,11 +280,12 @@ class ModelRunner:
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        outputs = torch.zeros(max_bs, tc.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
+        # prepare cuda graphs for different batch sizes
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])

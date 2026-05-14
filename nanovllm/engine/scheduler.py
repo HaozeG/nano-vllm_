@@ -56,7 +56,7 @@ class Scheduler:
 
         # decode
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.running.popleft()
+            seq = self.running.popleft()       # schedule the running seqs in a round-robin manner to ensure fairness
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -75,10 +75,11 @@ class Scheduler:
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
-        self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)
+        self.block_manager.deallocate(seq)  # deallocate all blocks to save memory, the preempted seq will re-allocate blocks when it is scheduled again
+        self.waiting.appendleft(seq)        # preempted seq has higher priority in the next schedule
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+        # postprocess the generated token ids and update the status of the corresponding seqs
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
