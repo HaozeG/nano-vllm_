@@ -55,7 +55,7 @@ class PartialRotaryEmbedding(nn.Module):
         super().__init__()
         self.head_size = head_size
         self.rotary_dim = rotary_dim
-        inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / head_size))
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
