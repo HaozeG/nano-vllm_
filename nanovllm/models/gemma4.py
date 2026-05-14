@@ -236,13 +236,14 @@ class Gemma4TextModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        self.embed_scale = config.hidden_size ** 0.5
         self.layers = nn.ModuleList(
             [Gemma4TextDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(input_ids) * self.embed_scale
         for layer in self.layers:
             hidden_states = layer(positions, hidden_states)
         return self.norm(hidden_states)
