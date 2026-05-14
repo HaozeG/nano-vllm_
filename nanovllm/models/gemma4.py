@@ -139,7 +139,7 @@ class Gemma4TextAttention(nn.Module):
 
         self.attn = Attention(
             self.num_heads, self.head_dim,
-            scale=self.head_dim ** -0.5,
+            scale=1.0,  # Gemma4 uses scale=1.0; q_norm/k_norm compensate for head_dim
             num_kv_heads=self.num_kv_heads,
             window_size=window,
         )
