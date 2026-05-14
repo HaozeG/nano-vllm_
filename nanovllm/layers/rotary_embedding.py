@@ -67,15 +67,16 @@ class PartialRotaryEmbedding(nn.Module):
     def forward(self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor):
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
-        rd = self.rotary_dim
+        half = self.head_size // 2       # 256 for head_size=512
+        rd_half = self.rotary_dim // 2   # 64 for rotary_dim=128
 
         def rot_partial(x):
-            x_r = x[..., :rd].float()
-            x_p = x[..., rd:]
-            x1, x2 = x_r.chunk(2, dim=-1)
-            y1 = x1 * cos - x2 * sin
-            y2 = x2 * cos + x1 * sin
-            return torch.cat([torch.cat([y1, y2], dim=-1).to(x.dtype), x_p], dim=-1)
+            # HF pairs element i with i+head_size//2 (rotate_half convention)
+            x1 = x[..., :rd_half].float()
+            x2 = x[..., half:half + rd_half].float()
+            y1 = (x1 * cos - x2 * sin).to(x.dtype)
+            y2 = (x2 * cos + x1 * sin).to(x.dtype)
+            return torch.cat([y1, x[..., rd_half:half], y2, x[..., half + rd_half:]], dim=-1)
 
         return rot_partial(query), rot_partial(key)
 
