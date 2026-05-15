@@ -1,3 +1,5 @@
+import os
+import time
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -6,6 +8,26 @@ import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+
+# Attention profiling — enabled with NANOVLLM_PROFILE_ATTN=1
+# Set NANOVLLM_PROFILE_SYNC=1 to add cuda.synchronize() at each timing boundary
+_PROFILE_ATTN = os.getenv("NANOVLLM_PROFILE_ATTN", "0") == "1"
+_PROFILE_SYNC  = os.getenv("NANOVLLM_PROFILE_SYNC",  "0") == "1"
+_attn_log: list[dict] = []
+
+
+def get_attn_log() -> list[dict]:
+    return _attn_log
+
+
+def clear_attn_log() -> None:
+    _attn_log.clear()
+
+
+def _ts() -> float:
+    if _PROFILE_SYNC:
+        torch.cuda.synchronize()
+    return time.perf_counter()
 
 
 @triton.jit
@@ -125,7 +147,20 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if self._use_sdpa:
-            return self._sdpa_forward(q, k, v, context)
+            if _PROFILE_ATTN:
+                t0 = _ts()
+            o = self._sdpa_forward(q, k, v, context)
+            if _PROFILE_ATTN:
+                _attn_log.append({
+                    "layer_type": "full",
+                    "is_prefill": context.is_prefill,
+                    "n_tokens": q.shape[0],
+                    "n_ctx": int(context.context_lens.float().mean().item()) if not context.is_prefill else int(context.cu_seqlens_k[-1].item()),
+                    "t_ms": (_ts() - t0) * 1000,
+                })
+            return o
+        if _PROFILE_ATTN:
+            t0 = _ts()
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
@@ -139,4 +174,12 @@ class Attention(nn.Module):
                                         cache_seqlens=context.context_lens, block_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True,
                                         window_size=self.window_size)
+        if _PROFILE_ATTN:
+            _attn_log.append({
+                "layer_type": "sliding",
+                "is_prefill": context.is_prefill,
+                "n_tokens": q.shape[0],
+                "n_ctx": int(context.context_lens.float().mean().item()) if not context.is_prefill else int(context.max_seqlen_k),
+                "t_ms": (_ts() - t0) * 1000,
+            })
         return o
