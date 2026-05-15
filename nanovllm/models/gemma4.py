@@ -6,7 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanovllm.layers.activation import GeluAndMul
-from nanovllm.layers.attention import Attention
+from nanovllm.layers.attention import (Attention, _PROFILE_ATTN_DETAIL,
+                                        _attn_detail_log, _attn_detail_pending)
 from nanovllm.layers.layernorm import RMSNorm, RMSNormNoScale
 from nanovllm.layers.rotary_embedding import get_rope, get_partial_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
@@ -194,6 +195,7 @@ class Gemma4TextAttention(nn.Module):
 
     def __init__(self, config, layer_idx: int):
         super().__init__()
+        self._layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx]
         self.is_sliding = (self.layer_type == "sliding_attention")
         self.num_heads = config.num_attention_heads
@@ -240,23 +242,72 @@ class Gemma4TextAttention(nn.Module):
         )
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states) if not self.kv_eq else k
+        if not _PROFILE_ATTN_DETAIL:
+            q = self.q_proj(hidden_states)
+            k = self.k_proj(hidden_states)
+            v = self.v_proj(hidden_states) if not self.kv_eq else k
+            N = q.shape[0]
+            q = q.view(N, self.num_heads, self.head_dim)
+            k = k.view(N, self.num_kv_heads, self.head_dim)
+            v = v.view(N, self.num_kv_heads, self.head_dim)
+            # Reshape to 2D for norm to avoid torch.compile rank-mismatch recompilations
+            q = self.q_norm(q.reshape(N * self.num_heads, self.head_dim)).view(N, self.num_heads, self.head_dim)
+            k = self.k_norm(k.reshape(N * self.num_kv_heads, self.head_dim)).view(N, self.num_kv_heads, self.head_dim)
+            v = self.v_norm(v.reshape(N * self.num_kv_heads, self.head_dim)).view(N, self.num_kv_heads, self.head_dim)
+            q, k = self.rotary_emb(positions, q, k)
+            o = self.attn(q, k, v)
+            return self.o_proj(o.flatten(1, -1))
+
+        # Profiling path — same computation with per-subcomponent timing.
+        _ctx = _get_context()
+        _rec: dict = {
+            "layer_idx": self._layer_idx,
+            "layer_type": self.layer_type,
+            "is_prefill": _ctx.is_prefill,
+            "n_tokens": hidden_states.shape[0],
+            "batch_size": (hidden_states.shape[0] if _ctx.is_prefill
+                           else int(len(_ctx.context_lens))),
+            "context_len": (int(_ctx.cu_seqlens_k[-1].item()) if _ctx.is_prefill
+                            else int(_ctx.context_lens.float().mean().item())),
+        }
+        _tA = _ts()
+
+        _t = _ts(); q = self.q_proj(hidden_states);               _rec["q_proj_ms"] = (_ts() - _t) * 1000
+        _t = _ts(); k = self.k_proj(hidden_states);               _rec["k_proj_ms"] = (_ts() - _t) * 1000
+        if self.kv_eq:
+            _rec["v_proj_ms"] = 0.0
+            v = k
+        else:
+            _t = _ts(); v = self.v_proj(hidden_states);           _rec["v_proj_ms"] = (_ts() - _t) * 1000
 
         N = q.shape[0]
         q = q.view(N, self.num_heads, self.head_dim)
         k = k.view(N, self.num_kv_heads, self.head_dim)
         v = v.view(N, self.num_kv_heads, self.head_dim)
 
-        # Reshape to 2D for norm to avoid torch.compile rank-mismatch recompilations
+        _t = _ts()
         q = self.q_norm(q.reshape(N * self.num_heads, self.head_dim)).view(N, self.num_heads, self.head_dim)
+        _rec["q_norm_ms"] = (_ts() - _t) * 1000
+        _t = _ts()
         k = self.k_norm(k.reshape(N * self.num_kv_heads, self.head_dim)).view(N, self.num_kv_heads, self.head_dim)
+        _rec["k_norm_ms"] = (_ts() - _t) * 1000
+        _t = _ts()
         v = self.v_norm(v.reshape(N * self.num_kv_heads, self.head_dim)).view(N, self.num_kv_heads, self.head_dim)
+        _rec["v_norm_ms"] = (_ts() - _t) * 1000
 
-        q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
-        return self.o_proj(o.flatten(1, -1))
+        _t = _ts(); q, k = self.rotary_emb(positions, q, k);     _rec["rotary_ms"] = (_ts() - _t) * 1000
+
+        o = self.attn(q, k, v)  # populates _attn_detail_pending
+
+        _rec["kv_cache_update_ms"]      = _attn_detail_pending.get("kv_cache_update_ms", 0.0)
+        _rec["kv_gather_or_padding_ms"] = _attn_detail_pending.get("kv_gather_or_padding_ms", 0.0)
+        _rec["attention_kernel_ms"]     = _attn_detail_pending.get("attention_kernel_ms", 0.0)
+
+        _t = _ts(); result = self.o_proj(o.flatten(1, -1));       _rec["o_proj_ms"] = (_ts() - _t) * 1000
+
+        _rec["total_ms"] = (_ts() - _tA) * 1000
+        _attn_detail_log.append(_rec)
+        return result
 
 
 # ---------------------------------------------------------------------------

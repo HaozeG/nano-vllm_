@@ -9,11 +9,23 @@ import triton.language as tl
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 
-# Attention profiling — enabled with NANOVLLM_PROFILE_ATTN=1
-# Set NANOVLLM_PROFILE_SYNC=1 to add cuda.synchronize() at each timing boundary
-_PROFILE_ATTN = os.getenv("NANOVLLM_PROFILE_ATTN", "0") == "1"
-_PROFILE_SYNC  = os.getenv("NANOVLLM_PROFILE_SYNC",  "0") == "1"
+# ---------------------------------------------------------------------------
+# Profiling flags
+# NANOVLLM_PROFILE_ATTN=1       — simple per-call timing to _attn_log
+# NANOVLLM_PROFILE_ATTN_DETAIL=1 — per-subcomponent timing to _attn_detail_log
+# NANOVLLM_PROFILE_SYNC=1       — add cuda.synchronize() at each timing boundary
+# Do not combine PROFILE_ATTN and PROFILE_ATTN_DETAIL in the same run.
+# ---------------------------------------------------------------------------
+_PROFILE_ATTN        = os.getenv("NANOVLLM_PROFILE_ATTN",        "0") == "1"
+_PROFILE_ATTN_DETAIL = os.getenv("NANOVLLM_PROFILE_ATTN_DETAIL", "0") == "1"
+_PROFILE_SYNC        = os.getenv("NANOVLLM_PROFILE_SYNC",        "0") == "1"
+
 _attn_log: list[dict] = []
+
+# Staging dict for detail profiling: Attention.forward() populates, Gemma4TextAttention.forward() consumes.
+# Never reassigned — only cleared/updated so that importers always reference the same object.
+_attn_detail_log: list[dict] = []
+_attn_detail_pending: dict = {}
 
 
 def get_attn_log() -> list[dict]:
@@ -22,6 +34,14 @@ def get_attn_log() -> list[dict]:
 
 def clear_attn_log() -> None:
     _attn_log.clear()
+
+
+def get_attn_detail_log() -> list[dict]:
+    return _attn_detail_log
+
+
+def clear_attn_detail_log() -> None:
+    _attn_detail_log.clear()
 
 
 def _ts() -> float:
@@ -133,10 +153,13 @@ class Attention(nn.Module):
             return torch.cat(parts, dim=0)
         else:
             # Decode: gather KV for all sequences into a padded batch, then one SDPA call.
-            # Eliminates bs separate SDPA launches (was 10 × 5-layer = 50/step).
             bs = q.shape[0]
             ctx_lens = context.context_lens.long()  # [bs]
             max_ctx = int(ctx_lens.max().item())
+
+            if _PROFILE_ATTN_DETAIL:
+                _tg = _ts()
+
             # Gather K, V: [bs, max_ctx, nkv, D]
             k_pad = k_cache.new_zeros(bs, max_ctx, k_cache.shape[2], k_cache.shape[3])
             v_pad = torch.zeros_like(k_pad)
@@ -156,19 +179,41 @@ class Attention(nn.Module):
             # Padding mask: positions ≥ ctx_len[i] are ignored
             pad = torch.arange(max_ctx, device=q.device).unsqueeze(0) >= ctx_lens.unsqueeze(1)
             bias = q.new_zeros(bs, 1, 1, max_ctx).masked_fill_(pad[:, None, None, :], float('-inf'))
+
+            if _PROFILE_ATTN_DETAIL:
+                _attn_detail_pending["kv_gather_or_padding_ms"] = (_ts() - _tg) * 1000
+                _tk = _ts()
+
             o = F.scaled_dot_product_attention(q4, k4, v4, attn_mask=bias, scale=self.scale)
+
+            if _PROFILE_ATTN_DETAIL:
+                _attn_detail_pending["attention_kernel_ms"] = (_ts() - _tk) * 1000
+
             return o.squeeze(2)  # [bs, H, D]
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+
+        if _PROFILE_ATTN_DETAIL:
+            _attn_detail_pending.clear()
+            _tstore = _ts()
+
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+
+        if _PROFILE_ATTN_DETAIL:
+            _attn_detail_pending["kv_cache_update_ms"] = (_ts() - _tstore) * 1000
+
         if self._use_sdpa:
-            if _PROFILE_ATTN:
+            if _PROFILE_ATTN_DETAIL and context.is_prefill:
+                # Prefill SDPA: gather + kernel not separately timed (decode is the bottleneck)
+                _attn_detail_pending["kv_gather_or_padding_ms"] = 0.0
+                _attn_detail_pending["attention_kernel_ms"] = 0.0
+            elif _PROFILE_ATTN and not _PROFILE_ATTN_DETAIL:
                 t0 = _ts()
             o = self._sdpa_forward(q, k, v, context)
-            if _PROFILE_ATTN:
+            if _PROFILE_ATTN and not _PROFILE_ATTN_DETAIL:
                 _attn_log.append({
                     "layer_type": "full",
                     "is_prefill": context.is_prefill,
@@ -177,8 +222,14 @@ class Attention(nn.Module):
                     "t_ms": (_ts() - t0) * 1000,
                 })
             return o
-        if _PROFILE_ATTN:
+
+        # Flash-attn path (sliding attention, head_dim ≤ 256)
+        if _PROFILE_ATTN_DETAIL:
+            _attn_detail_pending["kv_gather_or_padding_ms"] = 0.0  # FA2 reads KV cache internally
+            _tk = _ts()
+        elif _PROFILE_ATTN:
             t0 = _ts()
+
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
@@ -192,7 +243,10 @@ class Attention(nn.Module):
                                         cache_seqlens=context.context_lens, block_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True,
                                         window_size=self.window_size)
-        if _PROFILE_ATTN:
+
+        if _PROFILE_ATTN_DETAIL:
+            _attn_detail_pending["attention_kernel_ms"] = (_ts() - _tk) * 1000
+        elif _PROFILE_ATTN:
             _attn_log.append({
                 "layer_type": "sliding",
                 "is_prefill": context.is_prefill,
