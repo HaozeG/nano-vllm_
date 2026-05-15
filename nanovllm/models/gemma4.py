@@ -101,7 +101,9 @@ class Gemma4TextExperts(nn.Module):
 
     # Tokens above this threshold use the sorted-dispatch PyTorch path to
     # avoid the large x_gathered temporary ([total_tok, H]) on prefill.
-    _TRITON_TOK_LIMIT = 2048
+    # Must be >= max_num_seqs * top_k (512 * 8 = 4096) so all decode batch
+    # sizes use the Triton path, which is required for CUDA graph capture.
+    _TRITON_TOK_LIMIT = 4096
 
     def forward(self, x: torch.Tensor, top_k_idx: torch.Tensor, top_k_w: torch.Tensor):
         # x: [N, H]  top_k_idx/top_k_w: [N, K]

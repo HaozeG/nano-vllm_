@@ -140,10 +140,11 @@ def moe_experts_forward(
     sorted_w      = flat_w[perm]
     sorted_tok    = tok_idx[perm]
 
-    # Fixed-width E-slot counts — no variable-length output, CUDA-graph compatible.
-    # unique_consecutive returned n_active ≤ E entries; bincount always returns E entries.
+    # Fixed-width E-slot counts — CUDA-graph compatible.
+    # scatter_add_ is safe; bincount may internally sync for output-size detection.
     E      = gate_up_proj.shape[0]
-    counts = torch.bincount(flat_e, minlength=E).to(torch.int32)   # [E]
+    counts = torch.zeros(E, dtype=torch.int32, device=x.device)
+    counts.scatter_add_(0, flat_e, torch.ones(flat_e.shape[0], dtype=torch.int32, device=x.device))
     starts = torch.zeros(E, dtype=torch.int32, device=x.device)
     starts[1:] = counts[:-1].cumsum(0).to(torch.int32)
     eids   = torch.arange(E, dtype=torch.int32, device=x.device)
