@@ -168,15 +168,10 @@ class Attention(nn.Module):
             bt = context.block_tables[:, :max_nb]          # [B, max_nb]
             k_pad = k_cache[bt].reshape(bs, max_nb * block_size, Hkv, Dkv)[:, :max_ctx]
             v_pad = v_cache[bt].reshape(bs, max_nb * block_size, Hkv, Dkv)[:, :max_ctx]
-            # GQA expansion: [bs, max_ctx, nkv, D] → [bs, max_ctx, H, D]
-            if self.num_kv_heads < self.num_heads:
-                r = self.num_heads // self.num_kv_heads
-                k_pad = k_pad.repeat_interleave(r, dim=2)
-                v_pad = v_pad.repeat_interleave(r, dim=2)
-            # Rearrange to [bs, H, seq, D] for SDPA
-            q4 = q.unsqueeze(2)              # [bs, H, 1, D]
-            k4 = k_pad.permute(0, 2, 1, 3)  # [bs, H, max_ctx, D]
-            v4 = v_pad.permute(0, 2, 1, 3)  # [bs, H, max_ctx, D]
+            # Pass unexpanded KV to SDPA — PyTorch 2.8 handles GQA (Hkv | Hq) natively.
+            q4 = q.unsqueeze(2)              # [bs, Hq, 1, D]
+            k4 = k_pad.permute(0, 2, 1, 3)  # [bs, Hkv, max_ctx, D]
+            v4 = v_pad.permute(0, 2, 1, 3)  # [bs, Hkv, max_ctx, D]
             # Padding mask: positions ≥ ctx_len[i] are ignored
             pad = torch.arange(max_ctx, device=q.device).unsqueeze(0) >= ctx_lens.unsqueeze(1)
             bias = q.new_zeros(bs, 1, 1, max_ctx).masked_fill_(pad[:, None, None, :], float('-inf'))
