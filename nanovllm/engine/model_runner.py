@@ -243,7 +243,10 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            next_bs = next(x for x in self.graph_bs if x >= bs)
+            actual_nb = context.block_tables.size(1)
+            nb = next(x for x in self.graph_nb if x >= actual_nb)
+            graph = self.graphs[(next_bs, nb)]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -251,7 +254,9 @@ class ModelRunner:
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            bt = graph_vars["block_tables_by_nb"][nb]
+            bt.zero_()
+            bt[:bs, :actual_nb] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -279,7 +284,6 @@ class ModelRunner:
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, tc.hidden_size)
         # Fine-grained buckets in [10,16] cover max_concurrency=10 with ≤10% padding waste.
         # Coarse step-16 buckets above 16 keep graph count manageable for larger models.
@@ -288,27 +292,36 @@ class ModelRunner:
             + list(range(10, min(max_bs, 16) + 1, 2))
             + list(range(16, max_bs + 1, 16))
         ))
+        # nb buckets: 80 covers ctx≤1280, 128 covers ctx≤2048, max_num_blocks is the fallback.
+        # At ctx≈1124 (benchmark typical), nb=128 saves 50% of KV block reads vs nb=256.
+        self.graph_nb = sorted(set(
+            [nb for nb in [80, 128] if nb < max_num_blocks]
+            + [max_num_blocks]
+        ))
+        block_tables_by_nb = {nb: torch.zeros(max_bs, nb, dtype=torch.int32) for nb in self.graph_nb}
         self.graphs = {}
         self.graph_pool = None
 
-        # prepare cuda graphs for different batch sizes
-        for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-            reset_context()
+        # 2D capture: nb outer (graph memory shape), bs inner (padding).
+        for nb in reversed(self.graph_nb):
+            bt = block_tables_by_nb[nb]
+            for bs in reversed(self.graph_bs):
+                graph = torch.cuda.CUDAGraph()
+                set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=bt[:bs])
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+                with torch.cuda.graph(graph, self.graph_pool):
+                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                if self.graph_pool is None:
+                    self.graph_pool = graph.pool()
+                self.graphs[(bs, nb)] = graph
+                torch.cuda.synchronize()
+                reset_context()
 
         self.graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
-            block_tables=block_tables,
+            block_tables_by_nb=block_tables_by_nb,
             outputs=outputs,
         )
