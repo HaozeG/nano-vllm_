@@ -168,10 +168,15 @@ class Attention(nn.Module):
             bt = context.block_tables[:, :max_nb]          # [B, max_nb]
             k_pad = k_cache[bt].reshape(bs, max_nb * block_size, Hkv, Dkv)[:, :max_ctx]
             v_pad = v_cache[bt].reshape(bs, max_nb * block_size, Hkv, Dkv)[:, :max_ctx]
-            # Pass unexpanded KV to SDPA — PyTorch 2.8 handles GQA (Hkv | Hq) natively.
+            # GQA expansion: [bs, max_ctx, Hkv, D] → [bs, max_ctx, Hq, D].
+            # PyTorch SDPA MATH backend requires matching head counts (Hkv=2 ≠ Hq=16).
+            if self.num_kv_heads < self.num_heads:
+                r = self.num_heads // self.num_kv_heads
+                k_pad = k_pad.repeat_interleave(r, dim=2)
+                v_pad = v_pad.repeat_interleave(r, dim=2)
             q4 = q.unsqueeze(2)              # [bs, Hq, 1, D]
-            k4 = k_pad.permute(0, 2, 1, 3)  # [bs, Hkv, max_ctx, D]
-            v4 = v_pad.permute(0, 2, 1, 3)  # [bs, Hkv, max_ctx, D]
+            k4 = k_pad.permute(0, 2, 1, 3)  # [bs, Hq, max_ctx, D]
+            v4 = v_pad.permute(0, 2, 1, 3)  # [bs, Hq, max_ctx, D]
             # Padding mask: positions ≥ ctx_len[i] are ignored
             pad = torch.arange(max_ctx, device=q.device).unsqueeze(0) >= ctx_lens.unsqueeze(1)
             bias = q.new_zeros(bs, 1, 1, max_ctx).masked_fill_(pad[:, None, None, :], float('-inf'))
