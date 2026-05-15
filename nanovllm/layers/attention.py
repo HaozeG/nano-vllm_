@@ -132,14 +132,32 @@ class Attention(nn.Module):
                 parts.append(_sdpa_seq(qi, ki, vi, self.scale, self.num_heads))
             return torch.cat(parts, dim=0)
         else:
+            # Decode: gather KV for all sequences into a padded batch, then one SDPA call.
+            # Eliminates bs separate SDPA launches (was 10 × 5-layer = 50/step).
             bs = q.shape[0]
-            parts = []
+            ctx_lens = context.context_lens.long()  # [bs]
+            max_ctx = int(ctx_lens.max().item())
+            # Gather K, V: [bs, max_ctx, nkv, D]
+            k_pad = k_cache.new_zeros(bs, max_ctx, k_cache.shape[2], k_cache.shape[3])
+            v_pad = torch.zeros_like(k_pad)
             for i in range(bs):
-                ctx = int(context.context_lens[i])
-                ki = _gather_paged(k_cache, context.block_tables[i], ctx, block_size)
-                vi = _gather_paged(v_cache, context.block_tables[i], ctx, block_size)
-                parts.append(_sdpa_seq(q[i:i + 1], ki, vi, self.scale, self.num_heads))
-            return torch.cat(parts, dim=0)
+                c = int(ctx_lens[i])
+                k_pad[i, :c] = _gather_paged(k_cache, context.block_tables[i], c, block_size)
+                v_pad[i, :c] = _gather_paged(v_cache, context.block_tables[i], c, block_size)
+            # GQA expansion: [bs, max_ctx, nkv, D] → [bs, max_ctx, H, D]
+            if self.num_kv_heads < self.num_heads:
+                r = self.num_heads // self.num_kv_heads
+                k_pad = k_pad.repeat_interleave(r, dim=2)
+                v_pad = v_pad.repeat_interleave(r, dim=2)
+            # Rearrange to [bs, H, seq, D] for SDPA
+            q4 = q.unsqueeze(2)              # [bs, H, 1, D]
+            k4 = k_pad.permute(0, 2, 1, 3)  # [bs, H, max_ctx, D]
+            v4 = v_pad.permute(0, 2, 1, 3)  # [bs, H, max_ctx, D]
+            # Padding mask: positions ≥ ctx_len[i] are ignored
+            pad = torch.arange(max_ctx, device=q.device).unsqueeze(0) >= ctx_lens.unsqueeze(1)
+            bias = q.new_zeros(bs, 1, 1, max_ctx).masked_fill_(pad[:, None, None, :], float('-inf'))
+            o = F.scaled_dot_product_attention(q4, k4, v4, attn_mask=bias, scale=self.scale)
+            return o.squeeze(2)  # [bs, H, D]
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
