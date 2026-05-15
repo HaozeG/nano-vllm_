@@ -1,5 +1,48 @@
 import torch
+import triton
+import triton.language as tl
 from torch import nn
+
+
+# ---------------------------------------------------------------------------
+# Triton RMSNorm kernels — one program per row, FP32 accum, BF16 I/O.
+# Used for decode-scale tensors (N ≤ _TRITON_NORM_MAX_N) to cut Python
+# dispatch and intermediate-tensor overhead vs the @torch.compile path.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _rms_norm_fwd(
+    x_ptr, w_ptr, out_ptr,
+    stride_row, H, eps,
+    BLOCK_H: tl.constexpr,
+):
+    row  = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+    x    = tl.load(x_ptr + row * stride_row + offs, mask=mask, other=0.0).to(tl.float32)
+    var  = tl.sum(x * x, 0) / H
+    rrms = tl.rsqrt(var + eps)
+    w    = tl.load(w_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+    tl.store(out_ptr + row * stride_row + offs, (x * rrms * w).to(tl.bfloat16), mask=mask)
+
+
+@triton.jit
+def _rms_norm_noscale_fwd(
+    x_ptr, out_ptr,
+    stride_row, H, eps,
+    BLOCK_H: tl.constexpr,
+):
+    row  = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+    x    = tl.load(x_ptr + row * stride_row + offs, mask=mask, other=0.0).to(tl.float32)
+    var  = tl.sum(x * x, 0) / H
+    rrms = tl.rsqrt(var + eps)
+    tl.store(out_ptr + row * stride_row + offs, (x * rrms).to(tl.bfloat16), mask=mask)
+
+
+# Triton path active for BF16 decode tensors; @torch.compile fallback for large prefill.
+_TRITON_NORM_MAX_N = 256
 
 
 class RMSNorm(nn.Module):
@@ -44,10 +87,20 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            return self.rms_forward(x)
-        else:
+        if residual is not None:
             return self.add_rms_forward(x, residual)
+        if (x.dtype == torch.bfloat16 and x.ndim == 2
+                and x.shape[0] <= _TRITON_NORM_MAX_N):
+            x = x.contiguous()
+            N, H = x.shape
+            out = torch.empty_like(x)
+            _rms_norm_fwd[(N,)](
+                x, self.weight, out,
+                x.stride(0), H, self.eps,
+                BLOCK_H=triton.next_power_of_2(H), num_warps=4,
+            )
+            return out
+        return self.rms_forward(x)
 
 
 class RMSNormNoScale(nn.Module):
@@ -58,8 +111,22 @@ class RMSNormNoScale(nn.Module):
         self.eps = eps
 
     @torch.compile
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _compiled(self, x: torch.Tensor) -> torch.Tensor:
         orig = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return x.to(orig)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (x.dtype == torch.bfloat16 and x.ndim == 2
+                and x.shape[0] <= _TRITON_NORM_MAX_N):
+            x = x.contiguous()
+            N, H = x.shape
+            out = torch.empty_like(x)
+            _rms_norm_noscale_fwd[(N,)](
+                x, out,
+                x.stride(0), H, self.eps,
+                BLOCK_H=triton.next_power_of_2(H), num_warps=4,
+            )
+            return out
+        return self._compiled(x)

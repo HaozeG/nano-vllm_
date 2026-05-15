@@ -67,11 +67,14 @@ class Gemma4TextRouter(nn.Module):
         self.scale = nn.Parameter(torch.ones(H))
         self.per_expert_scale = nn.Parameter(torch.ones(E))
 
-    def forward(self, x: torch.Tensor):
-        # RMSNorm without learnable scale, then apply scale param
+    @torch.compile
+    def _norm_and_scale(self, x: torch.Tensor) -> torch.Tensor:
         xf = x.float()
         xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
-        xf = xf.to(x.dtype) * self.scale * self.scalar
+        return xf.to(x.dtype) * self.scale * self.scalar
+
+    def forward(self, x: torch.Tensor):
+        xf = self._norm_and_scale(x)
         logits = self.proj(xf)
         probs = F.softmax(logits, dim=-1)
         top_k_w, top_k_idx = probs.topk(self.top_k, dim=-1)
@@ -369,11 +372,8 @@ class Gemma4TextDecoderLayer(nn.Module):
 
             x_flat = residual.reshape(-1, residual.shape[-1])
 
-            # Router sub-components (inlined to avoid changing return signature)
-            _t = _ts()
-            _xf = x_flat.float()
-            _xf = _xf * torch.rsqrt(_xf.pow(2).mean(-1, keepdim=True) + self.router.eps)
-            _xf = _xf.to(x_flat.dtype) * self.router.scale * self.router.scalar
+            # Router sub-components
+            _t = _ts(); _xf = self.router._norm_and_scale(x_flat)
             _rec["t_router_norm_ms"] = (_ts() - _t) * 1000
             _t = _ts(); _logits = self.router.proj(_xf)
             _rec["t_router_linear_ms"] = (_ts() - _t) * 1000
