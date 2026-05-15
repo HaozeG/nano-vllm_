@@ -10,6 +10,7 @@ from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm, RMSNormNoScale
 from nanovllm.layers.rotary_embedding import get_rope, get_partial_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.layers.moe_kernels import moe_experts_forward as _moe_triton
 
 # ---------------------------------------------------------------------------
 # MoE profiling — enabled with NANOVLLM_PROFILE_MOE=1
@@ -81,59 +82,70 @@ class Gemma4TextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(E, 2 * I, H))
         self.down_proj = nn.Parameter(torch.empty(E, H, I))
 
+    # Tokens above this threshold use the sorted-dispatch PyTorch path to
+    # avoid the large x_gathered temporary ([total_tok, H]) on prefill.
+    _TRITON_TOK_LIMIT = 2048
+
     def forward(self, x: torch.Tensor, top_k_idx: torch.Tensor, top_k_w: torch.Tensor):
         # x: [N, H]  top_k_idx/top_k_w: [N, K]
         N, K = top_k_idx.shape[0], top_k_idx.shape[1]
         I = self.I
-        out = torch.zeros_like(x)
 
         if _PROFILE_MOE:
             t0 = _ts()
 
-        # --- Sort-based dispatch (eliminates per-expert GPU→CPU sync) ---
-        # Flatten all token-expert assignments.
-        flat_experts = top_k_idx.view(-1)                                # [N*K]
-        flat_weights = top_k_w.view(-1)                                  # [N*K]
-        token_idx    = torch.arange(N, device=x.device).repeat_interleave(K)  # [N*K]
+        # --- Triton grouped GEMM path (decode & small prefill) ---
+        if N * K <= self._TRITON_TOK_LIMIT:
+            out = _moe_triton(x, top_k_idx, top_k_w, self.gate_up_proj, self.down_proj)
+            if _PROFILE_MOE:
+                t2 = _ts()
+                stats = {"n_tokens": N, "n_assignments": N * K,
+                         "t_dispatch_ms": 0.0, "t_gemm_ms": (t2 - t0) * 1000,
+                         "t_total_ms": (t2 - t0) * 1000}
+                if _moe_log:
+                    _moe_log[-1].update(stats)
+                else:
+                    _moe_log.append(stats)
+                _moe_log[-1].setdefault("n_active", -1)
+            return out
 
-        # Sort by expert index on GPU so consecutive entries belong to the same expert.
-        perm            = flat_experts.argsort(stable=True)
-        sorted_experts  = flat_experts[perm]
-        sorted_weights  = flat_weights[perm]
-        sorted_tok_idx  = token_idx[perm]
+        # --- Sorted-dispatch PyTorch path (large prefill) ---
+        out = torch.zeros_like(x)
 
-        # unique_consecutive stays on GPU; one .tolist() is the only CPU transfer per layer
-        # (old code: one .item() + one nonzero() sync per active expert — up to K*N syncs).
+        flat_experts = top_k_idx.view(-1)
+        flat_weights = top_k_w.view(-1)
+        token_idx    = torch.arange(N, device=x.device).repeat_interleave(K)
+
+        perm           = flat_experts.argsort(stable=True)
+        sorted_experts = flat_experts[perm]
+        sorted_weights = flat_weights[perm]
+        sorted_tok_idx = token_idx[perm]
+
         unique_e, counts = torch.unique_consecutive(sorted_experts, return_counts=True)
-        expert_ids   = unique_e.tolist()   # single GPU→CPU transfer for loop control
-        group_sizes  = counts.tolist()
+        expert_ids  = unique_e.tolist()
+        group_sizes = counts.tolist()
 
         if _PROFILE_MOE:
             t1 = _ts()
 
-        # Process each expert's tokens as a contiguous GPU slice — no sync inside loop.
         offset = 0
         for e, cnt in zip(expert_ids, group_sizes):
-            tok = sorted_tok_idx[offset:offset + cnt]          # GPU slice
-            w   = sorted_weights[offset:offset + cnt, None]    # GPU slice  [T, 1]
-            x_e  = x[tok]                                      # [T, H]
-            gu   = F.linear(x_e, self.gate_up_proj[e])        # [T, 2I]
-            act  = F.gelu(gu[..., :I], approximate="tanh") * gu[..., I:]  # [T, I]
-            out_e = F.linear(act, self.down_proj[e])           # [T, H]
+            tok  = sorted_tok_idx[offset:offset + cnt]
+            w    = sorted_weights[offset:offset + cnt, None]
+            x_e  = x[tok]
+            gu   = F.linear(x_e, self.gate_up_proj[e])
+            act  = F.gelu(gu[..., :I], approximate="tanh") * gu[..., I:]
+            out_e = F.linear(act, self.down_proj[e])
             out.index_add_(0, tok, (out_e * w).to(out.dtype))
             offset += cnt
 
         if _PROFILE_MOE:
             t2 = _ts()
-            stats = {
-                "n_tokens":       N,
-                "n_assignments":  N * K,
-                "n_active":       len(expert_ids),
-                "t_dispatch_ms":  (t1 - t0) * 1000,
-                "t_gemm_ms":      (t2 - t1) * 1000,
-                "t_total_ms":     (t2 - t0) * 1000,
-            }
-            # Decoder layer pre-pends router timing into _moe_log[-1]; merge here.
+            stats = {"n_tokens": N, "n_assignments": N * K,
+                     "n_active": len(expert_ids),
+                     "t_dispatch_ms": (t1 - t0) * 1000,
+                     "t_gemm_ms": (t2 - t1) * 1000,
+                     "t_total_ms": (t2 - t0) * 1000}
             if _moe_log:
                 _moe_log[-1].update(stats)
             else:
