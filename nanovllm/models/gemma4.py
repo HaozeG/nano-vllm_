@@ -11,16 +11,21 @@ from nanovllm.layers.layernorm import RMSNorm, RMSNormNoScale
 from nanovllm.layers.rotary_embedding import get_rope, get_partial_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.layers.moe_kernels import moe_experts_forward as _moe_triton
+from nanovllm.utils.context import get_context as _get_context
 
 # ---------------------------------------------------------------------------
-# MoE profiling — enabled with NANOVLLM_PROFILE_MOE=1
-# Add NANOVLLM_PROFILE_SYNC=1 to insert cuda.synchronize() at each checkpoint
-# (measures GPU time rather than CPU-submission time, but adds overhead).
+# Profiling flags — enabled with env vars; zero overhead when disabled.
+# NANOVLLM_PROFILE_MOE=1   — MoE-only timing (router + expert GEMM)
+# NANOVLLM_PROFILE_LAYER=1 — full decoder-layer component timing
+# NANOVLLM_PROFILE_SYNC=1  — add cuda.synchronize() at each boundary
+# Do not combine PROFILE_MOE and PROFILE_LAYER in the same run.
 # ---------------------------------------------------------------------------
-_PROFILE_MOE  = os.getenv("NANOVLLM_PROFILE_MOE",  "0") == "1"
-_PROFILE_SYNC = os.getenv("NANOVLLM_PROFILE_SYNC", "0") == "1"
+_PROFILE_MOE   = os.getenv("NANOVLLM_PROFILE_MOE",   "0") == "1"
+_PROFILE_LAYER = os.getenv("NANOVLLM_PROFILE_LAYER",  "0") == "1"
+_PROFILE_SYNC  = os.getenv("NANOVLLM_PROFILE_SYNC",  "0") == "1"
 
-_moe_log: list[dict] = []  # one entry per (layer, step) when profiling is on
+_moe_log:   list[dict] = []
+_layer_log: list[dict] = []
 
 
 def get_moe_log() -> list[dict]:
@@ -29,6 +34,14 @@ def get_moe_log() -> list[dict]:
 
 def clear_moe_log() -> None:
     _moe_log.clear()
+
+
+def get_layer_profile_log() -> list[dict]:
+    return _layer_log
+
+
+def clear_layer_profile_log() -> None:
+    _layer_log.clear()
 
 
 def _ts() -> float:
@@ -251,6 +264,7 @@ class Gemma4TextDecoderLayer(nn.Module):
 
     def __init__(self, config, layer_idx: int):
         super().__init__()
+        self._layer_idx = layer_idx
         H = config.hidden_size
         eps = config.rms_norm_eps
 
@@ -279,34 +293,122 @@ class Gemma4TextDecoderLayer(nn.Module):
             self.pre_feedforward_layernorm_2 = RMSNorm(H, eps=eps)
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Attention sub-layer: norm → attn → post-norm → residual add
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+        # ----------------------------------------------------------------
+        # Fast path — no profiling overhead.
+        # ----------------------------------------------------------------
+        if not _PROFILE_LAYER:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.self_attn(positions, hidden_states)
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            if self.enable_moe:
+                hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
+                x_flat = residual.reshape(-1, residual.shape[-1])
+                if _PROFILE_MOE:
+                    _tr0 = _ts()
+                top_k_w, top_k_idx = self.router(x_flat)
+                if _PROFILE_MOE:
+                    _moe_log.append({"t_router_ms": (_ts() - _tr0) * 1000})
+                x_moe = self.pre_feedforward_layernorm_2(x_flat)
+                moe_out = self.experts(x_moe, top_k_idx, top_k_w)
+                moe_out = self.post_feedforward_layernorm_2(moe_out.reshape(residual.shape))
+                hidden_states = hidden_states_1 + moe_out
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+            return hidden_states * self.layer_scalar
 
-        # Feedforward sub-layer: residual → pre-norm → shared MLP
+        # ----------------------------------------------------------------
+        # Profiling path (NANOVLLM_PROFILE_LAYER=1).
+        # Computes the same result; adds fine-grained per-component timing.
+        # ----------------------------------------------------------------
+        _ctx = _get_context()
+        _rec: dict = {
+            "layer_idx": self._layer_idx,
+            "layer_type": self.self_attn.layer_type,
+            "is_prefill": _ctx.is_prefill,
+            "n_tokens": hidden_states.shape[0],
+        }
+        _tL = _ts()
+
         residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        _t = _ts(); hidden_states = self.input_layernorm(hidden_states)
+        _rec["t_input_norm_ms"] = (_ts() - _t) * 1000
+
+        _t = _ts(); hidden_states = self.self_attn(positions, hidden_states)
+        _rec["t_self_attn_ms"] = (_ts() - _t) * 1000
+
+        _t = _ts(); hidden_states = self.post_attention_layernorm(hidden_states)
+        _rec["t_post_attn_norm_ms"] = (_ts() - _t) * 1000
+
+        _t = _ts(); hidden_states = residual + hidden_states
+        _rec["t_attn_residual_ms"] = (_ts() - _t) * 1000
+
+        residual = hidden_states
+        _t = _ts(); hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        _rec["t_pre_ff_norm_ms"] = (_ts() - _t) * 1000
+
+        # Shared MLP: time each sub-op
+        _t = _ts(); _g = self.mlp.gate_proj(hidden_states)
+        _rec["t_mlp_gate_ms"] = (_ts() - _t) * 1000
+        _t = _ts(); _u = self.mlp.up_proj(hidden_states)
+        _rec["t_mlp_up_ms"] = (_ts() - _t) * 1000
+        _t = _ts(); _a = F.gelu(_g, approximate="tanh") * _u
+        _rec["t_mlp_act_ms"] = (_ts() - _t) * 1000
+        _t = _ts(); hidden_states = self.mlp.down_proj(_a)
+        _rec["t_mlp_down_ms"] = (_ts() - _t) * 1000
+        _rec["t_mlp_ms"] = (_rec["t_mlp_gate_ms"] + _rec["t_mlp_up_ms"]
+                            + _rec["t_mlp_act_ms"] + _rec["t_mlp_down_ms"])
 
         if self.enable_moe:
-            hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
+            _t = _ts(); hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
+            _rec["t_post_ff_norm1_ms"] = (_ts() - _t) * 1000
+
             x_flat = residual.reshape(-1, residual.shape[-1])
-            if _PROFILE_MOE:
-                _tr0 = _ts()
-            top_k_w, top_k_idx = self.router(x_flat)
-            if _PROFILE_MOE:
-                _moe_log.append({"t_router_ms": (_ts() - _tr0) * 1000})
-            x_moe = self.pre_feedforward_layernorm_2(x_flat)
-            moe_out = self.experts(x_moe, top_k_idx, top_k_w)  # merges its dict into _moe_log[-1]
+
+            # Router sub-components (inlined to avoid changing return signature)
+            _t = _ts()
+            _xf = x_flat.float()
+            _xf = _xf * torch.rsqrt(_xf.pow(2).mean(-1, keepdim=True) + self.router.eps)
+            _xf = _xf.to(x_flat.dtype) * self.router.scale * self.router.scalar
+            _rec["t_router_norm_ms"] = (_ts() - _t) * 1000
+            _t = _ts(); _logits = self.router.proj(_xf)
+            _rec["t_router_linear_ms"] = (_ts() - _t) * 1000
+            _t = _ts()
+            _probs = F.softmax(_logits, dim=-1)
+            top_k_w, top_k_idx = _probs.topk(self.router.top_k, dim=-1)
+            top_k_w = top_k_w / top_k_w.sum(dim=-1, keepdim=True)
+            top_k_w = top_k_w * self.router.per_expert_scale[top_k_idx]
+            _rec["t_router_topk_ms"] = (_ts() - _t) * 1000
+            _rec["t_router_ms"] = (_rec["t_router_norm_ms"] + _rec["t_router_linear_ms"]
+                                   + _rec["t_router_topk_ms"])
+
+            _t = _ts(); x_moe = self.pre_feedforward_layernorm_2(x_flat)
+            _rec["t_pre_ff_norm2_ms"] = (_ts() - _t) * 1000
+
+            _t = _ts(); moe_out = self.experts(x_moe, top_k_idx, top_k_w)
+            _rec["t_experts_ms"] = (_ts() - _t) * 1000
+
+            _t = _ts()
             moe_out = self.post_feedforward_layernorm_2(moe_out.reshape(residual.shape))
+            _rec["t_post_ff_norm2_ms"] = (_ts() - _t) * 1000
+
             hidden_states = hidden_states_1 + moe_out
 
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-        hidden_states = hidden_states * self.layer_scalar
+        _t = _ts(); hidden_states = self.post_feedforward_layernorm(hidden_states)
+        _rec["t_post_ff_norm_final_ms"] = (_ts() - _t) * 1000
+
+        _t = _ts(); hidden_states = residual + hidden_states
+        _rec["t_final_residual_ms"] = (_ts() - _t) * 1000
+
+        _t = _ts(); hidden_states = hidden_states * self.layer_scalar
+        _rec["t_layer_scalar_ms"] = (_ts() - _t) * 1000
+
+        _rec["t_total_ms"] = (_ts() - _tL) * 1000
+        _layer_log.append(_rec)
         return hidden_states
 
 
