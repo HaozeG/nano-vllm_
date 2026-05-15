@@ -281,7 +281,13 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, tc.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # Fine-grained buckets in [10,16] cover max_concurrency=10 with ≤10% padding waste.
+        # Coarse step-16 buckets above 16 keep graph count manageable for larger models.
+        self.graph_bs = sorted(set(
+            [1, 2, 4, 8]
+            + list(range(10, min(max_bs, 16) + 1, 2))
+            + list(range(16, max_bs + 1, 16))
+        ))
         self.graphs = {}
         self.graph_pool = None
 
