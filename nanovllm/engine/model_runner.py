@@ -269,6 +269,11 @@ class ModelRunner:
         hf_config = config.hf_config
         tc = _text_config(hf_config)
         max_bs = min(self.config.max_num_seqs, 512)
+        # Full-attention SDPA (head_dim > 256) allocates [bs, max_ctx, Hq, head_dim] K/V
+        # tensors during decode. For Gemma4 with max_ctx=4096: bs × ~67 MB per tensor.
+        # Cap to 16 so peak stays ~2 GB — the benchmark never exceeds 10 concurrent seqs.
+        if getattr(tc, 'global_head_dim', 0) > 256:
+            max_bs = min(max_bs, 16)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
