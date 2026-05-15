@@ -160,13 +160,14 @@ class Attention(nn.Module):
             if _PROFILE_ATTN_DETAIL:
                 _tg = _ts()
 
-            # Gather K, V: [bs, max_ctx, nkv, D]
-            k_pad = k_cache.new_zeros(bs, max_ctx, k_cache.shape[2], k_cache.shape[3])
-            v_pad = torch.zeros_like(k_pad)
-            for i in range(bs):
-                c = int(ctx_lens[i])
-                k_pad[i, :c] = _gather_paged(k_cache, context.block_tables[i], c, block_size)
-                v_pad[i, :c] = _gather_paged(v_cache, context.block_tables[i], c, block_size)
+            # Vectorised paged KV gather: k_cache[bt] → [B, max_nb, block_size, Hkv, D].
+            # Positions beyond ctx_lens[i] hold stale cache data; the bias mask below
+            # sets those positions to −∞ so they have no effect on the output.
+            Hkv, Dkv = k_cache.shape[2], k_cache.shape[3]
+            max_nb = (max_ctx + block_size - 1) // block_size
+            bt = context.block_tables[:, :max_nb]          # [B, max_nb]
+            k_pad = k_cache[bt].reshape(bs, max_nb * block_size, Hkv, Dkv)[:, :max_ctx]
+            v_pad = v_cache[bt].reshape(bs, max_nb * block_size, Hkv, Dkv)[:, :max_ctx]
             # GQA expansion: [bs, max_ctx, nkv, D] → [bs, max_ctx, H, D]
             if self.num_kv_heads < self.num_heads:
                 r = self.num_heads // self.num_kv_heads
