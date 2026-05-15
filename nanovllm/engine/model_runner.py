@@ -46,11 +46,6 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        # MoE models have data-dependent routing — incompatible with CUDA graphs
-        tc = _text_config(hf_config)
-        if getattr(tc, 'enable_moe_block', False):
-            self.enforce_eager = True
-
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()

@@ -140,14 +140,13 @@ def moe_experts_forward(
     sorted_w      = flat_w[perm]
     sorted_tok    = tok_idx[perm]
 
-    unique_e, counts = torch.unique_consecutive(sorted_e, return_counts=True)
-
-    # Build cumulative starts on GPU (int32 for Triton pointer arithmetic)
-    starts = torch.zeros_like(counts)
-    starts[1:] = counts[:-1].cumsum(0)
-    eids   = unique_e.to(torch.int32)
-    starts = starts.to(torch.int32)
-    counts = counts.to(torch.int32)
+    # Fixed-width E-slot counts — no variable-length output, CUDA-graph compatible.
+    # unique_consecutive returned n_active ≤ E entries; bincount always returns E entries.
+    E      = gate_up_proj.shape[0]
+    counts = torch.bincount(flat_e, minlength=E).to(torch.int32)   # [E]
+    starts = torch.zeros(E, dtype=torch.int32, device=x.device)
+    starts[1:] = counts[:-1].cumsum(0).to(torch.int32)
+    eids   = torch.arange(E, dtype=torch.int32, device=x.device)
 
     total_tok = N_tok * K
 

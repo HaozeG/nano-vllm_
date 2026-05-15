@@ -155,7 +155,10 @@ class Attention(nn.Module):
             # Decode: gather KV for all sequences into a padded batch, then one SDPA call.
             bs = q.shape[0]
             ctx_lens = context.context_lens.long()  # [bs]
-            max_ctx = int(ctx_lens.max().item())
+            # Static upper bound — no CPU-GPU sync, required for CUDA graph compatibility.
+            # block_tables.shape[1] == max_num_blocks for CUDA graph captures; equals the
+            # per-batch max for eager runs. Padding mask zeros the extra positions.
+            max_ctx = context.block_tables.shape[1] * k_cache.shape[1]
 
             if _PROFILE_ATTN_DETAIL:
                 _tg = _ts()
