@@ -168,18 +168,22 @@ class Attention(nn.Module):
             bt = context.block_tables[:, :max_nb]          # [B, max_nb]
             k_pad = k_cache[bt].reshape(bs, max_nb * block_size, Hkv, Dkv)[:, :max_ctx]
             v_pad = v_cache[bt].reshape(bs, max_nb * block_size, Hkv, Dkv)[:, :max_ctx]
-            # GQA expansion: [bs, max_ctx, Hkv, D] → [bs, max_ctx, Hq, D].
-            # PyTorch SDPA MATH backend requires matching head counts (Hkv=2 ≠ Hq=16).
+            # MQA-style reshape: merge batch×Hkv into the batch dim, give K/V one singleton
+            # head each.  Q[i, j*r : j*r+r] attends to K[i, j] — identical GQA semantics,
+            # no repeat_interleave allocation.  PyTorch SDPA broadcasts singleton K/V heads.
+            q4 = q.unsqueeze(2)              # [bs, Hq, 1, D]
+            k4 = k_pad.permute(0, 2, 1, 3)  # [bs, Hkv, max_ctx, D]
+            v4 = v_pad.permute(0, 2, 1, 3)  # [bs, Hkv, max_ctx, D]
             if self.num_kv_heads < self.num_heads:
                 r = self.num_heads // self.num_kv_heads
-                k_pad = k_pad.repeat_interleave(r, dim=2)
-                v_pad = v_pad.repeat_interleave(r, dim=2)
-            q4 = q.unsqueeze(2)              # [bs, Hq, 1, D]
-            k4 = k_pad.permute(0, 2, 1, 3)  # [bs, Hq, max_ctx, D]
-            v4 = v_pad.permute(0, 2, 1, 3)  # [bs, Hq, max_ctx, D]
+                q4 = q4.reshape(bs * self.num_kv_heads, r, 1, Dkv)
+                k4 = k4.reshape(bs * self.num_kv_heads, 1, max_ctx, Dkv)
+                v4 = v4.reshape(bs * self.num_kv_heads, 1, max_ctx, Dkv)
             # Padding mask: positions ≥ ctx_len[i] are ignored
             pad = torch.arange(max_ctx, device=q.device).unsqueeze(0) >= ctx_lens.unsqueeze(1)
             bias = q.new_zeros(bs, 1, 1, max_ctx).masked_fill_(pad[:, None, None, :], float('-inf'))
+            if self.num_kv_heads < self.num_heads:
+                bias = bias.repeat_interleave(self.num_kv_heads, dim=0)  # [bs*Hkv, 1, 1, max_ctx]
 
             if _PROFILE_ATTN_DETAIL:
                 _attn_detail_pending["kv_gather_or_padding_ms"] = (_ts() - _tg) * 1000
@@ -190,7 +194,10 @@ class Attention(nn.Module):
             if _PROFILE_ATTN_DETAIL:
                 _attn_detail_pending["attention_kernel_ms"] = (_ts() - _tk) * 1000
 
-            return o.squeeze(2)  # [bs, H, D]
+            if self.num_kv_heads < self.num_heads:
+                # o: [bs*Hkv, r, 1, D] → [bs, Hq, D]
+                return o.squeeze(2).reshape(bs, self.num_heads, Dkv)
+            return o.squeeze(2)  # [bs, Hq, D]
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
