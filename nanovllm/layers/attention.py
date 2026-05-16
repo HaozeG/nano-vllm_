@@ -20,6 +20,10 @@ _PROFILE_ATTN        = os.getenv("NANOVLLM_PROFILE_ATTN",        "0") == "1"
 _PROFILE_ATTN_DETAIL = os.getenv("NANOVLLM_PROFILE_ATTN_DETAIL", "0") == "1"
 _PROFILE_SYNC        = os.getenv("NANOVLLM_PROFILE_SYNC",        "0") == "1"
 
+# NANOVLLM_DISABLE_VECTOR_GATHER=1 falls back to per-sequence SDPA gather (full-attn decode).
+# Requires eager mode (CUDA graphs use static shapes; this path calls ctx_lens.tolist()).
+_DISABLE_VECTOR_GATHER = os.getenv("NANOVLLM_DISABLE_VECTOR_GATHER", "0") == "1"
+
 _attn_log: list[dict] = []
 
 # Staging dict for detail profiling: Attention.forward() populates, Gemma4TextAttention.forward() consumes.
@@ -262,8 +266,25 @@ class Attention(nn.Module):
                 parts.append(_sdpa_seq(qi, ki, vi, self.scale, self.num_heads))
             return torch.cat(parts, dim=0)
         else:
-            # Decode: gather KV for all sequences into a padded batch, then one SDPA call.
+            # Decode: gather KV for all sequences, then SDPA.
             bs = q.shape[0]
+
+            if _DISABLE_VECTOR_GATHER:
+                # Sequential per-sequence gather (NANOVLLM_DISABLE_VECTOR_GATHER=1).
+                # Requires eager mode — ctx_lens.tolist() is a CPU sync.
+                if _PROFILE_ATTN_DETAIL:
+                    _tg = _ts()
+                ctx_lens_list = context.context_lens.tolist()
+                parts = []
+                for i in range(bs):
+                    ki = _gather_paged(k_cache, context.block_tables[i], ctx_lens_list[i], block_size)
+                    vi = _gather_paged(v_cache, context.block_tables[i], ctx_lens_list[i], block_size)
+                    parts.append(_sdpa_seq(q[i:i + 1], ki, vi, self.scale, self.num_heads))
+                if _PROFILE_ATTN_DETAIL:
+                    _attn_detail_pending["kv_gather_or_padding_ms"] = (_ts() - _tg) * 1000
+                    _attn_detail_pending["attention_kernel_ms"] = 0.0
+                return torch.cat(parts, dim=0)
+
             ctx_lens = context.context_lens.long()  # [bs]
             # Static upper bound — no CPU-GPU sync, required for CUDA graph compatibility.
             # block_tables.shape[1] == max_num_blocks for CUDA graph captures; equals the

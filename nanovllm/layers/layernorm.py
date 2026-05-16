@@ -1,8 +1,11 @@
+import os
 import torch
 import triton
 import triton.language as tl
 from torch import nn
 
+# NANOVLLM_DISABLE_TRITON_RMSNORM=1 forces @torch.compile fallback for all sizes.
+_DISABLE_TRITON_NORM = os.getenv("NANOVLLM_DISABLE_TRITON_RMSNORM", "0") == "1"
 
 # ---------------------------------------------------------------------------
 # Triton RMSNorm kernels — one program per row, FP32 accum, BF16 I/O.
@@ -89,7 +92,7 @@ class RMSNorm(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is not None:
             return self.add_rms_forward(x, residual)
-        if (x.dtype == torch.bfloat16 and x.ndim == 2
+        if (not _DISABLE_TRITON_NORM and x.dtype == torch.bfloat16 and x.ndim == 2
                 and x.shape[0] <= _TRITON_NORM_MAX_N):
             x = x.contiguous()
             N, H = x.shape
@@ -118,7 +121,7 @@ class RMSNormNoScale(nn.Module):
         return x.to(orig)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if (x.dtype == torch.bfloat16 and x.ndim == 2
+        if (not _DISABLE_TRITON_NORM and x.dtype == torch.bfloat16 and x.ndim == 2
                 and x.shape[0] <= _TRITON_NORM_MAX_N):
             x = x.contiguous()
             N, H = x.shape

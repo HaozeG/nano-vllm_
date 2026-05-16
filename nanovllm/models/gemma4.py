@@ -25,6 +25,9 @@ _PROFILE_MOE   = os.getenv("NANOVLLM_PROFILE_MOE",   "0") == "1"
 _PROFILE_LAYER = os.getenv("NANOVLLM_PROFILE_LAYER",  "0") == "1"
 _PROFILE_SYNC  = os.getenv("NANOVLLM_PROFILE_SYNC",  "0") == "1"
 
+# NANOVLLM_DISABLE_TRITON_MOE=1 forces the sorted-dispatch PyTorch path for all batch sizes.
+_DISABLE_TRITON_MOE = os.getenv("NANOVLLM_DISABLE_TRITON_MOE", "0") == "1"
+
 _moe_log:   list[dict] = []
 _layer_log: list[dict] = []
 
@@ -114,7 +117,7 @@ class Gemma4TextExperts(nn.Module):
             t0 = _ts()
 
         # --- Triton grouped GEMM path (decode & small prefill) ---
-        if N * K <= self._TRITON_TOK_LIMIT:
+        if not _DISABLE_TRITON_MOE and N * K <= self._TRITON_TOK_LIMIT:
             out = _moe_triton(x, top_k_idx, top_k_w, self.gate_up_proj, self.down_proj)
             if _PROFILE_MOE:
                 t2 = _ts()

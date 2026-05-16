@@ -1,3 +1,4 @@
+import os
 import pickle
 import torch
 import torch.distributed as dist
@@ -45,6 +46,11 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+
+        # NANOVLLM_DISABLE_CUDA_GRAPH=1 overrides enforce_eager at runtime without
+        # changing model_args — lets the ablation script use a pure env-var interface.
+        if os.getenv("NANOVLLM_DISABLE_CUDA_GRAPH", "0") == "1":
+            self.enforce_eager = True
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
