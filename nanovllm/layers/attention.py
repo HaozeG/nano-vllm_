@@ -342,20 +342,47 @@ class Attention(nn.Module):
             t0 = _ts()
 
         if context.is_prefill:
-            if context.block_tables is not None:
-                if k_cache.dtype == torch.float8_e4m3fn:
-                    # Convert only the blocks referenced by block_tables (typically
-                    # prefix_len / block_size blocks), not the entire FP8 cache.
-                    max_blk = int(context.block_tables[context.block_tables >= 0].max().item()) + 1
-                    k = k_cache[:max_blk].to(torch.bfloat16)
-                    v = v_cache[:max_blk].to(torch.bfloat16)
-                else:
+            if context.block_tables is not None and k_cache.dtype == torch.float8_e4m3fn:
+                # Prefix-cache + FP8: gather only the prefix blocks from FP8 cache
+                # (GPU fancy-index, no CPU sync) and cat with fresh K from projection.
+                # Two small .tolist() syncs on cu_seqlens (≤11 ints) replace the
+                # expensive per-element .item() that stalled GPU pipelining.
+                bs_c = k_cache.shape[1]
+                Hc, Dc = k_cache.shape[2], k_cache.shape[3]
+                cu_q = context.cu_seqlens_q.tolist()
+                cu_k = context.cu_seqlens_k.tolist()
+                nseq = len(cu_q) - 1
+                all_k, all_v = [], []
+                for i in range(nseq):
+                    sq = cu_q[i + 1] - cu_q[i]
+                    sk = cu_k[i + 1] - cu_k[i]
+                    plen = sk - sq
+                    fk_i = k[cu_q[i]:cu_q[i] + sq]
+                    fv_i = v[cu_q[i]:cu_q[i] + sq]
+                    if plen > 0:
+                        n_pb = (plen + bs_c - 1) // bs_c
+                        pblks = context.block_tables[i, :n_pb]          # GPU slice, no sync
+                        pk_i = k_cache[pblks].to(torch.bfloat16).reshape(-1, Hc, Dc)[:plen]
+                        pv_i = v_cache[pblks].to(torch.bfloat16).reshape(-1, Hc, Dc)[:plen]
+                        all_k.append(torch.cat([pk_i, fk_i]))
+                        all_v.append(torch.cat([pv_i, fv_i]))
+                    else:
+                        all_k.append(fk_i)
+                        all_v.append(fv_i)
+                k, v = torch.cat(all_k), torch.cat(all_v)
+                o = flash_attn_varlen_func(q, k, v,
+                                           max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                           max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                           softmax_scale=self.scale, causal=True,
+                                           window_size=self.window_size)
+            else:
+                if context.block_tables is not None:
                     k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables,
-                                       window_size=self.window_size)
+                o = flash_attn_varlen_func(q, k, v,
+                                           max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                           max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                           softmax_scale=self.scale, causal=True, block_table=context.block_tables,
+                                           window_size=self.window_size)
         else:    # decode
             if k_cache.dtype == torch.float8_e4m3fn:
                 # Custom Triton FP8 paged attention — reads half the KV bytes vs BF16
