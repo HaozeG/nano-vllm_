@@ -343,9 +343,14 @@ class Attention(nn.Module):
 
         if context.is_prefill:
             if context.block_tables is not None:
-                # FA2 varlen paged-KV requires BF16; dequantize FP8 cache on prefix-cache hit
-                k = k_cache.to(torch.bfloat16) if k_cache.dtype == torch.float8_e4m3fn else k_cache
-                v = v_cache.to(torch.bfloat16) if v_cache.dtype == torch.float8_e4m3fn else v_cache
+                if k_cache.dtype == torch.float8_e4m3fn:
+                    # Convert only the blocks referenced by block_tables (typically
+                    # prefix_len / block_size blocks), not the entire FP8 cache.
+                    max_blk = int(context.block_tables[context.block_tables >= 0].max().item()) + 1
+                    k = k_cache[:max_blk].to(torch.bfloat16)
+                    v = v_cache[:max_blk].to(torch.bfloat16)
+                else:
+                    k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
