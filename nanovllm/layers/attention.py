@@ -73,6 +73,29 @@ def store_kvcache_kernel(
     tl.store(v_cache_ptr + cache_offsets, value)
 
 
+@triton.jit
+def store_kvcache_kernel_fp8(
+    key_ptr,
+    key_stride,
+    value_ptr,
+    value_stride,
+    k_cache_ptr,
+    v_cache_ptr,
+    slot_mapping_ptr,
+    D: tl.constexpr,
+):
+    idx = tl.program_id(0)
+    slot = tl.load(slot_mapping_ptr + idx)
+    if slot == -1: return
+    key_offsets = idx * key_stride + tl.arange(0, D)
+    value_offsets = idx * value_stride + tl.arange(0, D)
+    key = tl.load(key_ptr + key_offsets)
+    value = tl.load(value_ptr + value_offsets)
+    cache_offsets = slot * D + tl.arange(0, D)
+    tl.store(k_cache_ptr + cache_offsets, key.to(tl.float8e4nv))
+    tl.store(v_cache_ptr + cache_offsets, value.to(tl.float8e4nv))
+
+
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
@@ -80,7 +103,94 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
-    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
+    kernel = store_kvcache_kernel_fp8 if k_cache.dtype == torch.float8_e4m3fn else store_kvcache_kernel
+    kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
+
+
+@triton.jit
+def _paged_attn_fp8_kernel(
+    Q,            # [bs, Hq, D] bfloat16
+    K_cache,      # [num_blocks, BLOCK_SIZE, Hkv, D] float8e4nv
+    V_cache,      # same
+    Out,          # [bs, Hq, D] bfloat16
+    ctx_lens,     # [bs] int32
+    block_table,  # [bs, max_nb] int32
+    scale,        # float32 scalar
+    max_nb,       # runtime int
+    window,       # runtime int (effective window = window_size[0] + 1)
+    Hq:         tl.constexpr,
+    Hkv:        tl.constexpr,
+    D:          tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    batch = pid // Hq
+    head  = pid % Hq
+    kv_head = head // (Hq // Hkv)
+
+    q_off = batch * Hq * D + head * D + tl.arange(0, D)
+    q = tl.load(Q + q_off).to(tl.float32) * scale  # [D]
+
+    ctx_len    = tl.load(ctx_lens + batch)
+    start_tok  = tl.maximum(0, ctx_len - window)
+    n_blocks   = tl.cdiv(ctx_len, BLOCK_SIZE)
+    start_blk  = start_tok // BLOCK_SIZE
+
+    m   = float(-1e20)
+    l   = 0.0
+    acc = tl.zeros([D], dtype=tl.float32)
+
+    s_idx      = tl.arange(0, BLOCK_SIZE)
+    d_idx      = tl.arange(0, D)
+    kv_stride  = Hkv * D       # stride per token within a block
+    blk_stride = BLOCK_SIZE * Hkv * D  # stride per physical block
+
+    for blk in range(start_blk, n_blocks):
+        phys = tl.load(block_table + batch * max_nb + blk)
+        base = phys * blk_stride + kv_head * D
+
+        k_off = base + s_idx[:, None] * kv_stride + d_idx[None, :]
+        k = tl.load(K_cache + k_off).to(tl.float32)      # [BLOCK_SIZE, D]
+
+        scores = tl.sum(q[None, :] * k, axis=1)          # [BLOCK_SIZE]
+        pos    = blk * BLOCK_SIZE + s_idx
+        scores = tl.where((pos >= start_tok) & (pos < ctx_len), scores, float(-1e20))
+
+        m_new  = tl.maximum(m, tl.max(scores, axis=0))
+        alpha  = tl.exp(m - m_new)
+        exp_s  = tl.exp(scores - m_new)                  # [BLOCK_SIZE]
+
+        v_off  = base + s_idx[:, None] * kv_stride + d_idx[None, :]
+        v      = tl.load(V_cache + v_off).to(tl.float32) # [BLOCK_SIZE, D]
+
+        acc = acc * alpha + tl.sum(exp_s[:, None] * v, axis=0)
+        l   = l   * alpha + tl.sum(exp_s, axis=0)
+        m   = m_new
+
+    safe_l = tl.maximum(l, 1e-9)
+    tl.store(Out + batch * Hq * D + head * D + d_idx, (acc / safe_l).to(tl.bfloat16))
+
+
+def paged_attn_fp8_decode(
+    q: torch.Tensor,             # [bs, Hq, D] bfloat16
+    k_cache: torch.Tensor,       # [num_blocks, block_size, Hkv, D] float8e4nv
+    v_cache: torch.Tensor,
+    ctx_lens: torch.Tensor,      # [bs] int32
+    block_tables: torch.Tensor,  # [bs, max_nb] int32
+    scale: float,
+    window: int,
+) -> torch.Tensor:
+    bs, Hq, D = q.shape
+    Hkv       = k_cache.shape[2]
+    block_size = k_cache.shape[1]
+    max_nb    = block_tables.shape[1]
+    out = torch.empty(bs, Hq, D, dtype=torch.bfloat16, device=q.device)
+    _paged_attn_fp8_kernel[(bs * Hq,)](
+        q, k_cache, v_cache, out,
+        ctx_lens, block_tables, scale, max_nb, window,
+        Hq=Hq, Hkv=Hkv, D=D, BLOCK_SIZE=block_size,
+    )
+    return out
 
 
 def _gather_paged(cache: torch.Tensor, block_table: torch.Tensor, ctx_len: int, block_size: int) -> torch.Tensor:
@@ -232,18 +342,29 @@ class Attention(nn.Module):
             t0 = _ts()
 
         if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
-                k, v = k_cache, v_cache
+            if context.block_tables is not None:
+                # FA2 varlen paged-KV requires BF16; dequantize FP8 cache on prefix-cache hit
+                k = k_cache.to(torch.bfloat16) if k_cache.dtype == torch.float8_e4m3fn else k_cache
+                v = v_cache.to(torch.bfloat16) if v_cache.dtype == torch.float8_e4m3fn else v_cache
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables,
                                        window_size=self.window_size)
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
-                                        softmax_scale=self.scale, causal=True,
-                                        window_size=self.window_size)
+            if k_cache.dtype == torch.float8_e4m3fn:
+                # Custom Triton FP8 paged attention — reads half the KV bytes vs BF16
+                window = self.window_size[0] + 1  # +1 matches FA2 window_size=(wl,0) convention
+                o = paged_attn_fp8_decode(
+                    q, k_cache, v_cache,
+                    context.context_lens, context.block_tables,
+                    self.scale, window,
+                )
+            else:
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context.context_lens, block_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True,
+                                            window_size=self.window_size)
 
         if _PROFILE_ATTN_DETAIL:
             _attn_detail_pending["attention_kernel_ms"] = (_ts() - _tk) * 1000

@@ -132,7 +132,7 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        dtype_bytes = hf_config.dtype.itemsize
+        bf16_bytes = hf_config.dtype.itemsize
 
         # Build per-layer (n_kv_heads, head_dim) — handles both uniform and hybrid attention
         layer_types = getattr(tc, "layer_types", ["full_attention"] * tc.num_hidden_layers)
@@ -147,16 +147,24 @@ class ModelRunner:
                 hd = getattr(tc, "global_head_dim", None) or tc.head_dim
             kv_dims.append((n_kv, hd))
 
-        block_bytes = sum(2 * self.block_size * n * h * dtype_bytes for n, h in kv_dims)
+        # Sliding-attention layers use FP8 KV cache (1 byte/element vs 2 for BF16)
+        block_bytes = 0
+        for lt, (n, h) in zip(layer_types, kv_dims):
+            dbytes = 1 if lt == "sliding_attention" else bf16_bytes
+            block_bytes += 2 * self.block_size * n * h * dbytes
+
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0, "Not enough GPU memory for KV cache"
 
-        # Allocate one k_cache / v_cache tensor per layer
+        # Allocate one k_cache / v_cache tensor per layer with mixed dtype
         B = config.num_kvcache_blocks
-        self.kv_caches = [
-            (torch.empty(B, self.block_size, n, h), torch.empty(B, self.block_size, n, h))
-            for n, h in kv_dims
-        ]
+        self.kv_caches = []
+        for lt, (n, h) in zip(layer_types, kv_dims):
+            kv_dtype = torch.float8_e4m3fn if lt == "sliding_attention" else hf_config.dtype
+            self.kv_caches.append(
+                (torch.empty(B, self.block_size, n, h, dtype=kv_dtype),
+                 torch.empty(B, self.block_size, n, h, dtype=kv_dtype))
+            )
 
         layer_id = 0
         for module in self.model.modules():
